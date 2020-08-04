@@ -5,6 +5,11 @@
 
 package org.rust.lang.core.resolve
 
+import org.rust.MockEdition
+import org.rust.ProjectDescriptor
+import org.rust.WithDependencyRustProjectDescriptor
+import org.rust.cargo.project.workspace.CargoWorkspace
+
 class RsMacroResolveTest : RsResolveTestBase() {
     fun `test resolve simple matching with multiple pattern definition`() = checkByCode("""
         macro_rules! test {
@@ -142,6 +147,24 @@ class RsMacroResolveTest : RsResolveTestBase() {
         fn main() {
             foo!();
         } //^
+    """)
+
+    @ProjectDescriptor(WithDependencyRustProjectDescriptor::class)
+    @MockEdition(CargoWorkspace.Edition.EDITION_2018)
+    fun `test resolve macro in lexical order 4`() = stubOnlyResolve("""
+    //- lib.rs
+        #[macro_export]
+        macro_rules! foo { () => { /* 1 */ } }
+                    //X
+    //- main.rs
+        mod inner {
+            #[macro_export]
+            macro_rules! foo { () => { /* 2 */ } }
+        }
+        fn main() {
+            use test_package::foo;
+            foo!();
+        }  //^ lib.rs
     """)
 
     fun `test resolve macro missing macro_use`() = checkByCode("""
