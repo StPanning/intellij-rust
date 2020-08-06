@@ -29,6 +29,7 @@ import org.rust.cargo.project.workspace.CargoWorkspace
 import org.rust.cargo.project.workspace.PackageOrigin
 import org.rust.cargo.util.AutoInjectedCrates.CORE
 import org.rust.cargo.util.AutoInjectedCrates.STD
+import org.rust.ide.experiments.RsExperiments
 import org.rust.ide.injected.isDoctestInjection
 import org.rust.lang.RsConstants
 import org.rust.lang.core.FeatureAvailability
@@ -47,6 +48,7 @@ import org.rust.lang.core.resolve.NameResolutionTestmarks.selfInGroup
 import org.rust.lang.core.resolve.indexes.RsLangItemIndex
 import org.rust.lang.core.resolve.indexes.RsMacroIndex
 import org.rust.lang.core.resolve.ref.*
+import org.rust.lang.core.resolve2.processMacros
 import org.rust.lang.core.stubs.index.RsNamedElementIndex
 import org.rust.lang.core.types.*
 import org.rust.lang.core.types.consts.CtInferVar
@@ -54,6 +56,7 @@ import org.rust.lang.core.types.infer.foldCtConstParameterWith
 import org.rust.lang.core.types.infer.foldTyTypeParameterWith
 import org.rust.lang.core.types.infer.substitute
 import org.rust.lang.core.types.ty.*
+import org.rust.openapiext.isFeatureEnabled
 import org.rust.openapiext.testAssert
 import org.rust.openapiext.toPsiFile
 import org.rust.stdext.buildList
@@ -828,25 +831,32 @@ private class MacroResolver private constructor(private val processor: RsResolve
     private val visitor = MacroResolvingVisitor(reverse = true) { processor(it) }
 
     private fun processMacrosInLexicalOrderUpward(startElement: PsiElement): Boolean {
-        if (processScopesInLexicalOrderUpward(startElement)) {
-            return true
+        val result = processScopesInLexicalOrderUpward(startElement)
+        if (result == true) return true
+
+        // `startElement.parent is RsMod` => use `CrateDefMap` if new resolve is enabled
+        if (isFeatureEnabled(RsExperiments.RESOLVE_NEW)) {
+            check(result == null) { "we must encounter RsMod while processing scopes upward" }
+            return false
         }
 
-        val crateRoot = startElement.contextOrSelf<RsElement>()?.crateRoot as? RsFile
-        if (crateRoot != null) {
-            NameResolutionTestmarks.processSelfCrateExportedMacros.hit()
-            if (processAllScopeEntries(exportedMacrosAsScopeEntries(crateRoot), processor)) return true
-        }
+        if (processRemainedExportedMacros()) return true
 
-        return processRemainedExportedMacros()
+        val crateRoot = startElement.contextOrSelf<RsElement>()?.crateRoot as? RsFile ?: return false
+        NameResolutionTestmarks.processSelfCrateExportedMacros.hit()
+        return processAllScopeEntries(exportedMacrosAsScopeEntries(crateRoot), processor)
     }
 
     /**
      * In short, it processes left siblings, then left siblings of the parent (without parent itself) and so on
      * until root (file), then it goes up to module declaration of the file (`mod foo;`) and processes its
      * siblings, and so on until crate root
+     *
+     * `null` return value means `false` with additional information that:
+     * - new resolve engine is enabled
+     * - we should stop any further processing
      */
-    private fun processScopesInLexicalOrderUpward(startElement: PsiElement): Boolean {
+    private fun processScopesInLexicalOrderUpward(startElement: PsiElement): Boolean? {
         val stub = (startElement as? StubBasedPsiElement<*>)?.greenStub
         return if (stub != null) {
             stubBasedProcessScopesInLexicalOrderUpward(stub)
@@ -855,11 +865,7 @@ private class MacroResolver private constructor(private val processor: RsResolve
         }
     }
 
-    private tailrec fun psiBasedProcessScopesInLexicalOrderUpward(element: PsiElement): Boolean {
-        for (e in element.leftSiblings) {
-            if (visitor.processMacros(e)) return true
-        }
-
+    private tailrec fun psiBasedProcessScopesInLexicalOrderUpward(element: PsiElement): Boolean? {
         // ```
         // //- main.rs
         // macro_rules! foo { ... }
@@ -872,6 +878,15 @@ private class MacroResolver private constructor(private val processor: RsResolve
         val expandedFrom = (element as? RsExpandedElement)?.expandedFrom
         if (expandedFrom != null && processExpandedFrom(expandedFrom)) return true
         val context = expandedFrom ?: element.context ?: return false
+
+        if (isFeatureEnabled(RsExperiments.RESOLVE_NEW) && context is RsMod) {
+            processRemainedExportedMacros()  // process local imports
+            return if (processMacros(context, processor)) true else null
+        }
+        for (e in element.leftSiblings) {
+            if (visitor.processMacros(e)) return true
+        }
+
         return when {
             context is RsFile -> processScopesInLexicalOrderUpward(context.declaration ?: return false)
             // Optimization. Let this function be tailrec if go up by real parent (in the same file)
@@ -880,19 +895,26 @@ private class MacroResolver private constructor(private val processor: RsResolve
         }
     }
 
-    private tailrec fun stubBasedProcessScopesInLexicalOrderUpward(element: StubElement<*>): Boolean {
+    private tailrec fun stubBasedProcessScopesInLexicalOrderUpward(element: StubElement<*>): Boolean? {
         val parentStub = element.parentStub ?: return false
         val siblings = parentStub.childrenStubs
         val index = siblings.indexOf(element)
         check(index != -1) { "Can't find stub index" }
         val leftSiblings = siblings.subList(0, index)
-        for (it in leftSiblings) {
-            if (visitor.processMacros(it.psi)) return true
-        }
+
         // See comment in psiBasedProcessScopesInLexicalOrderUpward
         val expandedFrom = (element.psi as? RsExpandedElement)?.expandedFrom
         if (expandedFrom != null && processExpandedFrom(expandedFrom)) return true
         val parentPsi = expandedFrom ?: parentStub.psi
+
+        if (isFeatureEnabled(RsExperiments.RESOLVE_NEW) && parentPsi is RsMod) {
+            processRemainedExportedMacros()  // process local imports
+            return if (processMacros(parentPsi, processor)) true else null
+        }
+        for (it in leftSiblings) {
+            if (visitor.processMacros(it.psi)) return true
+        }
+
         return when {
             parentPsi is RsFile -> processScopesInLexicalOrderUpward(parentPsi.declaration ?: return false)
             // Optimization. Let this function be tailrec if go up by stub parent
